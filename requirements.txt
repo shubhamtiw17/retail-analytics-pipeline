@@ -1,0 +1,18 @@
+# Kafka
+kafka-python==2.0.2
+
+# Data generation
+faker==24.3.0
+
+# Environment
+python-dotenv==1.0.1
+
+# Storage
+minio==7.2.5
+
+# Database
+psycopg2-binary==2.9.9
+
+# Testing
+pytest==8.1.1
+pytest-cov==5.0.0
