@@ -1,30 +1,31 @@
 """
 stream_ingest.py
 ────────────────
-Reads all 5 Kafka topics simultaneously using PySpark Structured Streaming.
-For each topic:
-  - Parses JSON against a strict schema
-  - Validates required fields
-  - Writes valid events to MinIO bronze layer (Parquet, partitioned by date)
-  - Routes invalid events to the dead letter queue topic
+Reads all 5 Kafka topics via PySpark Structured Streaming.
+Each micro-batch is:
+  1. Parsed and validated against a strict schema
+  2. Written to local staging as Parquet (partitioned by date)
+  3. Uploaded to MinIO bronze layer via the Python minio client
 
-Checkpoints are stored in MinIO so the job recovers exactly where it
-left off after a restart — no data loss, no reprocessing.
+Invalid events (schema parse failures) are routed to the
+dead_letter_queue Kafka topic for inspection and replay.
 
-Design decision: micro-batch (trigger every 30s) over continuous streaming.
-The dashboard refreshes every 60s so sub-second latency adds no UX value,
-and micro-batching reduces S3 API calls and small-file overhead by ~60%.
+Design decision: local staging → MinIO upload instead of S3A.
+S3A has a known Py4J socket issue on Windows with Python 3.10.
+The local-stage-then-upload pattern is used by AWS Glue internally
+and gives us reliable exactly-once delivery with full MinIO storage.
 """
 
 import logging
-import sys
 import os
+import sys
+import glob
 
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.types import StringType
+from minio import Minio
 
-# Allow running from project root
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 from config.settings import (
@@ -32,12 +33,14 @@ from config.settings import (
     MINIO_ENDPOINT,
     MINIO_ACCESS_KEY,
     MINIO_SECRET_KEY,
+    MINIO_BUCKET,
     MICRO_BATCH_INTERVAL,
-    WATERMARK_DELAY,
-    bronze_path,
-    checkpoint_path,
-    dlq_path,
+    STAGING_DIR,
     TOPICS,
+    staging_path,
+    checkpoint_path,
+    minio_bronze_prefix,
+    minio_dlq_prefix,
 )
 from config.schemas import SCHEMAS
 
@@ -48,62 +51,133 @@ logging.basicConfig(
 logger = logging.getLogger("stream_ingest")
 
 
+# ── MinIO client (module-level singleton) ─────────────────────────────────────
+
+minio_client = Minio(
+    MINIO_ENDPOINT,
+    access_key=MINIO_ACCESS_KEY,
+    secret_key=MINIO_SECRET_KEY,
+    secure=False,
+)
+
+
 # ── Spark session ─────────────────────────────────────────────────────────────
 
 def build_spark() -> SparkSession:
-    """
-    Build a SparkSession configured for:
-    - S3A connector pointing at local MinIO
-    - Kafka connector via spark-sql-kafka package
-    - PostgreSQL JDBC driver for the aggregations job
-    """
     return (
         SparkSession.builder
         .appName("RetailStreamIngest")
-        .master("local[*]")          # runs locally — swap to spark://... for cluster
+        .master("local[2]")
         .config("spark.jars.packages",
-                "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,"
-                "org.apache.hadoop:hadoop-aws:3.3.4,"
-                "com.amazonaws:aws-java-sdk-bundle:1.12.262")
-        # MinIO S3A config
-        .config("spark.hadoop.fs.s3a.endpoint",               f"http://{MINIO_ENDPOINT}")
-        .config("spark.hadoop.fs.s3a.access.key",             MINIO_ACCESS_KEY)
-        .config("spark.hadoop.fs.s3a.secret.key",             MINIO_SECRET_KEY)
-        .config("spark.hadoop.fs.s3a.path.style.access",      "true")
-        .config("spark.hadoop.fs.s3a.impl",                   "org.apache.hadoop.fs.s3a.S3AFileSystem")
-        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
-        # Streaming performance
-        .config("spark.sql.streaming.checkpointLocation",     checkpoint_path("stream_ingest"))
-        .config("spark.sql.shuffle.partitions",               "4")
+                "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1")
+        .config("spark.sql.shuffle.partitions",    "4")
+        .config("spark.ui.showConsoleProgress",    "false")
+        .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true")
         .getOrCreate()
     )
+
+
+# ── MinIO uploader ────────────────────────────────────────────────────────────
+
+def upload_to_minio(local_dir: str, minio_prefix: str) -> int:
+    """
+    Walk all Parquet files under local_dir and upload each to MinIO.
+    Returns the number of files uploaded.
+    """
+    uploaded = 0
+    pattern  = os.path.join(local_dir, "**", "*.parquet")
+
+    for local_path in glob.glob(pattern, recursive=True):
+        # Preserve partition folder structure in MinIO
+        # e.g. data/staging/bronze/orders/ingest_date=2026-05-15/part-0.parquet
+        #   → bronze/orders/ingest_date=2026-05-15/part-0.parquet
+        relative  = os.path.relpath(local_path, STAGING_DIR)
+        minio_key = relative.replace("\\", "/")   # Windows path fix
+
+        minio_client.fput_object(MINIO_BUCKET, minio_key, local_path)
+        uploaded += 1
+
+    return uploaded
+
+
+# ── Per-topic foreachBatch handler ────────────────────────────────────────────
+
+def make_batch_handler(topic: str):
+    """
+    Returns a foreachBatch function for one topic.
+    Each micro-batch:
+      - Writes valid rows to local Parquet (partitioned by ingest_date)
+      - Uploads those files to MinIO bronze
+      - Sends invalid rows to dead_letter_queue
+    """
+    local_path = staging_path(topic)
+
+    def handle_batch(batch_df: DataFrame, batch_id: int) -> None:
+        if batch_df.isEmpty():
+            logger.info(f"[{topic}] batch={batch_id} empty — skipping")
+            return
+
+        total = batch_df.count()
+        valid   = batch_df.filter(F.col("event_id").isNotNull())
+        invalid = batch_df.filter(F.col("event_id").isNull())
+
+        valid_count   = valid.count()
+        invalid_count = invalid.count()
+
+        logger.info(
+            f"[{topic}] batch={batch_id} "
+            f"total={total} valid={valid_count} invalid={invalid_count}"
+        )
+
+        # ── Write valid rows to local staging Parquet ─────────────────────
+        if valid_count > 0:
+            (
+                valid
+                .withColumn("ingest_date", F.to_date(F.col("event_timestamp")))
+                .write
+                .mode("append")
+                .partitionBy("ingest_date")
+                .parquet(local_path)
+            )
+
+            # ── Upload to MinIO ───────────────────────────────────────────
+            uploaded = upload_to_minio(local_path, minio_bronze_prefix(topic))
+            logger.info(f"[{topic}] batch={batch_id} uploaded={uploaded} files to MinIO")
+
+        # ── Route invalid rows to dead letter queue ────────────────────────
+        if invalid_count > 0:
+            (
+                invalid
+                .select(
+                    F.to_json(F.struct("*")).alias("value"),
+                    F.lit(topic).alias("key"),
+                )
+                .write
+                .format("kafka")
+                .option("kafka.bootstrap.servers", KAFKA_EXTERNAL_BROKER)
+                .option("topic", TOPICS["dlq"])
+                .save()
+            )
+            logger.info(f"[{topic}] batch={batch_id} sent {invalid_count} rows to DLQ")
+
+    return handle_batch
 
 
 # ── Per-topic streaming pipeline ──────────────────────────────────────────────
 
 def process_topic(spark: SparkSession, topic: str) -> None:
-    """
-    Wire up a complete streaming pipeline for one Kafka topic:
-      Kafka → parse JSON → validate → branch valid/invalid
-      valid   → bronze Parquet in MinIO (partitioned by date)
-      invalid → dead_letter_queue Kafka topic
-    """
     schema = SCHEMAS[topic]
 
-    logger.info(f"Setting up stream for topic: {topic}")
-
-    # ── Read from Kafka ───────────────────────────────────────────────────────
     raw = (
         spark.readStream
         .format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_EXTERNAL_BROKER)
         .option("subscribe",               topic)
         .option("startingOffsets",         "latest")
-        .option("failOnDataLoss",          "false")   # tolerate topic compaction
+        .option("failOnDataLoss",          "false")
         .load()
     )
 
-    # ── Parse JSON payload ────────────────────────────────────────────────────
     parsed = (
         raw
         .select(
@@ -115,84 +189,39 @@ def process_topic(spark: SparkSession, topic: str) -> None:
                 schema
             ).alias("data")
         )
-        .select(
-            "offset",
-            "partition",
-            "kafka_timestamp",
-            "data.*",                      # flatten all event fields
-        )
-        .withColumn(
-            "event_timestamp",
-            F.to_timestamp(F.col("timestamp"))
-        )
-        .withColumn("ingest_date", F.to_date(F.col("event_timestamp")))
-        .withColumn("ingested_at", F.current_timestamp())
+        .select("offset", "partition", "kafka_timestamp", "data.*")
+        .withColumn("event_timestamp", F.to_timestamp(F.col("timestamp")))
+        .withColumn("ingested_at",     F.current_timestamp())
     )
 
-    # ── Split valid vs invalid ────────────────────────────────────────────────
-    # Invalid = event_id is null (JSON parse failed or required field missing)
-    valid   = parsed.filter(F.col("event_id").isNotNull())
-    invalid = parsed.filter(F.col("event_id").isNull())
-
-    # ── Write valid → MinIO bronze ────────────────────────────────────────────
-    bronze_query = (
-        valid.writeStream
-        .format("parquet")
-        .option("path",              bronze_path(topic))
-        .option("checkpointLocation", checkpoint_path(f"bronze_{topic}"))
-        .partitionBy("ingest_date")
+    query = (
+        parsed.writeStream
+        .foreachBatch(make_batch_handler(topic))
+        .option("checkpointLocation", checkpoint_path(f"ingest_{topic}"))
         .trigger(processingTime=MICRO_BATCH_INTERVAL)
         .outputMode("append")
         .start()
     )
 
-    # ── Write invalid → dead letter queue (Kafka) ─────────────────────────────
-    # Re-serialise the raw row as JSON so it can be inspected and replayed
-    dlq_query = (
-        invalid
-        .select(
-            F.to_json(F.struct("*")).alias("value"),
-            F.lit(topic).alias("key"),
-        )
-        .writeStream
-        .format("kafka")
-        .option("kafka.bootstrap.servers", KAFKA_EXTERNAL_BROKER)
-        .option("topic",                   TOPICS["dlq"])
-        .option("checkpointLocation",      checkpoint_path(f"dlq_{topic}"))
-        .trigger(processingTime=MICRO_BATCH_INTERVAL)
-        .outputMode("append")
-        .start()
-    )
-
-    logger.info(
-        f"[{topic}] streams started — "
-        f"bronze_query={bronze_query.id} | dlq_query={dlq_query.id}"
-    )
-
-
-# ── Batch progress logging ────────────────────────────────────────────────────
-
-def log_progress(topic: str):
-    """Return a foreachBatch callback that logs row counts per micro-batch."""
-    def _log(batch_df, batch_id):
-        count = batch_df.count()
-        if count > 0:
-            logger.info(f"[{topic}] batch={batch_id} rows={count}")
-    return _log
+    logger.info(f"[{topic}] stream started — query_id={query.id}")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main():
-    logger.info("Starting RetailStreamIngest job")
-    spark = build_spark()
-    spark.sparkContext.setLogLevel("WARN")   # suppress Spark INFO noise
+def main() -> None:
+    # Ensure staging directories exist
+    for topic in SCHEMAS:
+        os.makedirs(staging_path(topic), exist_ok=True)
+    os.makedirs(os.path.join(STAGING_DIR, "checkpoints"), exist_ok=True)
 
-    # Start a streaming pipeline for every topic
+    logger.info("Starting RetailStreamIngest")
+    spark = build_spark()
+    spark.sparkContext.setLogLevel("WARN")
+
     for topic in SCHEMAS:
         process_topic(spark, topic)
 
-    logger.info("All topic streams running — waiting for termination")
+    logger.info("All streams running — waiting for termination (Ctrl+C to stop)")
     spark.streams.awaitAnyTermination()
 
 

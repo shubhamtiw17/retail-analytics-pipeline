@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Kafka ─────────────────────────────────────────────────────────────────────
-KAFKA_BROKER          = os.getenv("KAFKA_BROKER", "localhost:9092")
+KAFKA_BROKER          = os.getenv("KAFKA_BROKER",          "localhost:9092")
 KAFKA_EXTERNAL_BROKER = os.getenv("KAFKA_EXTERNAL_BROKER", "localhost:9092")
 
 TOPICS = {
@@ -22,15 +22,20 @@ MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "admin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "password123")
 MINIO_BUCKET     = os.getenv("MINIO_BUCKET",     "retail-lake")
 
-# S3A path helpers
-def bronze_path(topic: str) -> str:
-    return f"s3a://{MINIO_BUCKET}/bronze/{topic}"
+# ── Local staging (Spark writes here, uploader pushes to MinIO) ───────────────
+STAGING_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "staging")
+
+def staging_path(topic: str) -> str:
+    return os.path.join(STAGING_DIR, "bronze", topic)
 
 def checkpoint_path(job: str) -> str:
-    return f"s3a://{MINIO_BUCKET}/checkpoints/{job}"
+    return os.path.join(STAGING_DIR, "checkpoints", job)
 
-def dlq_path() -> str:
-    return f"s3a://{MINIO_BUCKET}/dlq"
+def minio_bronze_prefix(topic: str) -> str:
+    return f"bronze/{topic}"
+
+def minio_dlq_prefix() -> str:
+    return "dlq"
 
 # ── PostgreSQL ────────────────────────────────────────────────────────────────
 POSTGRES_HOST     = os.getenv("POSTGRES_HOST",     "localhost")
@@ -50,7 +55,6 @@ POSTGRES_PROPERTIES = {
 }
 
 # ── Spark ─────────────────────────────────────────────────────────────────────
-SPARK_MASTER         = "spark://spark-master:7077"
 MICRO_BATCH_INTERVAL = "30 seconds"
 WINDOW_DURATION      = "5 minutes"
 WATERMARK_DELAY      = "10 minutes"

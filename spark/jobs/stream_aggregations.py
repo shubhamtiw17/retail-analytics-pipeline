@@ -1,23 +1,20 @@
 """
 stream_aggregations.py
 ──────────────────────
-Reads the orders and product_clicks bronze streams and computes
-rolling window KPIs that power the real-time dashboard:
+Reads orders and product_clicks from Kafka and computes
+rolling window KPIs written directly to PostgreSQL via psycopg2.
 
-  - orders_per_minute      (1-min tumbling window)
-  - revenue_last_5_min     (5-min sliding window)
-  - top_products_last_hour (1-hour window, top 10 by click count)
-
-Writes results to PostgreSQL every 60 seconds so the dashboard
-always has fresh data without hitting Kafka directly.
-
-Design decision: separate aggregation job from ingest job so each
-can be restarted independently without affecting the other.
+Uses psycopg2 instead of JDBC in foreachBatch to avoid the
+S3A Py4J socket issue — psycopg2 is a pure Python driver
+that works reliably on Windows with PySpark local mode.
 """
 
 import logging
-import sys
 import os
+import sys
+import psycopg2
+import psycopg2.extras
+import json
 
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
@@ -27,15 +24,14 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.
 
 from config.settings import (
     KAFKA_EXTERNAL_BROKER,
-    MINIO_ENDPOINT,
-    MINIO_ACCESS_KEY,
-    MINIO_SECRET_KEY,
-    POSTGRES_JDBC_URL,
-    POSTGRES_PROPERTIES,
-    WINDOW_DURATION,
+    POSTGRES_HOST,
+    POSTGRES_PORT,
+    POSTGRES_DB,
+    POSTGRES_USER,
+    POSTGRES_PASSWORD,
     WATERMARK_DELAY,
     checkpoint_path,
-    bronze_path,
+    STAGING_DIR,
 )
 from config.schemas import order_schema, click_schema
 
@@ -46,47 +42,90 @@ logging.basicConfig(
 logger = logging.getLogger("stream_aggregations")
 
 
+# ── PostgreSQL helpers ────────────────────────────────────────────────────────
+
+def get_pg_conn():
+    return psycopg2.connect(
+        host=POSTGRES_HOST,
+        port=POSTGRES_PORT,
+        dbname=POSTGRES_DB,
+        user=POSTGRES_USER,
+        password=POSTGRES_PASSWORD,
+    )
+
+
+def write_orders_agg(batch_df: DataFrame, batch_id: int) -> None:
+    if batch_df.isEmpty():
+        return
+
+    rows = batch_df.collect()
+    logger.info(f"[orders_agg] batch={batch_id} rows={len(rows)} → PostgreSQL")
+
+    sql = """
+        INSERT INTO agg_orders_per_minute
+            (window_start, window_end, region, order_count, revenue, avg_order_value)
+        VALUES (%s, %s, %s, %s, %s, %s)
+    """
+    conn = get_pg_conn()
+    try:
+        with conn.cursor() as cur:
+            for row in rows:
+                cur.execute(sql, (
+                    row.window_start,
+                    row.window_end,
+                    row.region,
+                    row.order_count,
+                    float(row.revenue) if row.revenue else 0.0,
+                    float(row.avg_order_value) if row.avg_order_value else 0.0,
+                ))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def write_products_agg(batch_df: DataFrame, batch_id: int) -> None:
+    if batch_df.isEmpty():
+        return
+
+    rows = batch_df.collect()
+    logger.info(f"[top_products] batch={batch_id} rows={len(rows)} → PostgreSQL")
+
+    sql = """
+        INSERT INTO agg_top_products
+            (window_start, window_end, product_id, category,
+             click_count, avg_duration_ms, unique_visitors)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """
+    conn = get_pg_conn()
+    try:
+        with conn.cursor() as cur:
+            for row in rows:
+                cur.execute(sql, (
+                    row.window_start,
+                    row.window_end,
+                    row.product_id,
+                    row.category,
+                    row.click_count,
+                    float(row.avg_duration_ms) if row.avg_duration_ms else 0.0,
+                    row.unique_visitors,
+                ))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ── Spark session ─────────────────────────────────────────────────────────────
 
 def build_spark() -> SparkSession:
     return (
         SparkSession.builder
         .appName("RetailStreamAggregations")
-        .master("local[*]")
+        .master("local[2]")
         .config("spark.jars.packages",
-                "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,"
-                "org.apache.hadoop:hadoop-aws:3.3.4,"
-                "com.amazonaws:aws-java-sdk-bundle:1.12.262,"
-                "org.postgresql:postgresql:42.7.1")
-        .config("spark.hadoop.fs.s3a.endpoint",               f"http://{MINIO_ENDPOINT}")
-        .config("spark.hadoop.fs.s3a.access.key",             MINIO_ACCESS_KEY)
-        .config("spark.hadoop.fs.s3a.secret.key",             MINIO_SECRET_KEY)
-        .config("spark.hadoop.fs.s3a.path.style.access",      "true")
-        .config("spark.hadoop.fs.s3a.impl",                   "org.apache.hadoop.fs.s3a.S3AFileSystem")
-        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
-        .config("spark.sql.shuffle.partitions",               "4")
+                "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1")
+        .config("spark.sql.shuffle.partitions",    "4")
+        .config("spark.ui.showConsoleProgress",    "false")
         .getOrCreate()
-    )
-
-
-# ── Write aggregation to PostgreSQL ──────────────────────────────────────────
-
-def write_to_postgres(batch_df: DataFrame, batch_id: int, table: str) -> None:
-    """foreachBatch sink — writes each micro-batch to a PostgreSQL table."""
-    if batch_df.isEmpty():
-        return
-    count = batch_df.count()
-    logger.info(f"[{table}] batch={batch_id} rows={count} → PostgreSQL")
-    (
-        batch_df.write
-        .format("jdbc")
-        .option("url",   POSTGRES_JDBC_URL)
-        .option("dbtable", table)
-        .option("user",    POSTGRES_PROPERTIES["user"])
-        .option("password", POSTGRES_PROPERTIES["password"])
-        .option("driver",  POSTGRES_PROPERTIES["driver"])
-        .mode("append")
-        .save()
     )
 
 
@@ -112,10 +151,7 @@ def orders_per_minute(spark: SparkSession) -> None:
 
     agg = (
         orders
-        .groupBy(
-            F.window("event_timestamp", "1 minute"),
-            "region"
-        )
+        .groupBy(F.window("event_timestamp", "1 minute"), "region")
         .agg(
             F.count("order_id").alias("order_count"),
             F.sum("total_amount").alias("revenue"),
@@ -128,14 +164,13 @@ def orders_per_minute(spark: SparkSession) -> None:
             "order_count",
             F.round("revenue", 2).alias("revenue"),
             F.round("avg_order_value", 2).alias("avg_order_value"),
-            F.current_timestamp().alias("computed_at"),
         )
     )
 
     (
         agg.writeStream
-        .foreachBatch(lambda df, bid: write_to_postgres(df, bid, "agg_orders_per_minute"))
-        .option("checkpointLocation", checkpoint_path("agg_orders_per_minute"))
+        .foreachBatch(write_orders_agg)
+        .option("checkpointLocation", checkpoint_path("agg_orders"))
         .trigger(processingTime="60 seconds")
         .outputMode("update")
         .start()
@@ -143,7 +178,7 @@ def orders_per_minute(spark: SparkSession) -> None:
     logger.info("orders_per_minute stream started")
 
 
-# ── Top products last hour ────────────────────────────────────────────────────
+# ── Top products ──────────────────────────────────────────────────────────────
 
 def top_products(spark: SparkSession) -> None:
     raw = (
@@ -165,11 +200,7 @@ def top_products(spark: SparkSession) -> None:
 
     agg = (
         clicks
-        .groupBy(
-            F.window("event_timestamp", "1 hour"),
-            "product_id",
-            "category",
-        )
+        .groupBy(F.window("event_timestamp", "1 hour"), "product_id", "category")
         .agg(
             F.count("event_id").alias("click_count"),
             F.avg("duration_ms").alias("avg_duration_ms"),
@@ -183,14 +214,13 @@ def top_products(spark: SparkSession) -> None:
             "click_count",
             F.round("avg_duration_ms", 0).alias("avg_duration_ms"),
             "unique_visitors",
-            F.current_timestamp().alias("computed_at"),
         )
     )
 
     (
         agg.writeStream
-        .foreachBatch(lambda df, bid: write_to_postgres(df, bid, "agg_top_products"))
-        .option("checkpointLocation", checkpoint_path("agg_top_products"))
+        .foreachBatch(write_products_agg)
+        .option("checkpointLocation", checkpoint_path("agg_products"))
         .trigger(processingTime="60 seconds")
         .outputMode("update")
         .start()
@@ -200,8 +230,10 @@ def top_products(spark: SparkSession) -> None:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main():
-    logger.info("Starting RetailStreamAggregations job")
+def main() -> None:
+    os.makedirs(os.path.join(STAGING_DIR, "checkpoints"), exist_ok=True)
+
+    logger.info("Starting RetailStreamAggregations")
     spark = build_spark()
     spark.sparkContext.setLogLevel("WARN")
 
