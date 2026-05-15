@@ -204,7 +204,7 @@ def top_products(spark: SparkSession) -> None:
         .agg(
             F.count("event_id").alias("click_count"),
             F.avg("duration_ms").alias("avg_duration_ms"),
-            F.countDistinct("customer_id").alias("unique_visitors"),
+            F.approx_count_distinct("customer_id").alias("unique_visitors"),
         )
         .select(
             F.col("window.start").alias("window_start"),
