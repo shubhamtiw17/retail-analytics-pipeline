@@ -72,7 +72,7 @@ jobs:
           python-version: "3.10"
 
       - name: Install dbt
-        run: pip install dbt-postgres==1.7.0
+        run: pip install dbt-postgres==1.7.0 protobuf==4.25.3
 
       - name: Create dbt profile
         run: |

@@ -12,7 +12,7 @@
 
 A production-grade, end-to-end streaming analytics platform that ingests
 e-commerce events in real time, processes them through a multi-layer
-lakehouse architecture, and serves live KPI dashboards — built to mirror
+lakehouse architecture, and serves live KPI dashboards built to mirror
 how data platforms at Amazon, Shopify, and Uber handle operational data
 at scale.
 
@@ -32,7 +32,7 @@ that mid-to-senior DE roles require in 2026:
 | **Warehouse modelling** | Star schema — 3 fact tables, 4 dim tables, ETL watermark tracking |
 | **Transformation layer** | dbt staging views + mart tables, 19 tests, lineage graph |
 | **Data quality** | Custom SQL assertions, orphan record detection, pipeline run logging |
-| **Containerisation** | Full stack in Docker Compose — 11 services, one command to start |
+| **Containerisation** | Full stack in Docker Compose: 11 services, one command to start |
 | **CI/CD** | GitHub Actions running lint, unit tests, dbt run + test on every push |
 | **API design** | FastAPI with 8 endpoints, Swagger docs, pagination, filtering |
 | **Documentation** | 12 architecture decisions, 6-scenario runbook, performance benchmarks |
