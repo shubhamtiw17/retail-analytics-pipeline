@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Lint with flake8
+        run: |
+          pip install flake8
+          flake8 generators/ config/ spark/ api/ dashboard/ \
+            --max-line-length=120 \
+            --ignore=E501,W503,E203 \
+            --exclude=__pycache__
+
+      - name: Run unit tests
+        run: pytest tests/test_event_generator.py -v --tb=short
+
+      - name: Validate docker-compose syntax
+        run: |
+          pip install docker-compose
+          docker-compose config --quiet
+
+  dbt-validation:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: retail_warehouse
+          POSTGRES_USER: retail
+          POSTGRES_PASSWORD: retail123
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dbt
+        run: pip install dbt-postgres==1.7.0
+
+      - name: Create dbt profile
+        run: |
+          mkdir -p ~/.dbt
+          cat > ~/.dbt/profiles.yml << EOF
+          retail_dbt:
+            target: dev
+            outputs:
+              dev:
+                type: postgres
+                host: localhost
+                port: 5432
+                user: retail
+                password: retail123
+                dbname: retail_warehouse
+                schema: dbt_marts
+                threads: 4
+          EOF
+
+      - name: Create warehouse tables
+        run: |
+          PGPASSWORD=retail123 psql -h localhost -U retail -d retail_warehouse \
+            -f warehouse/init/01_streaming_tables.sql
+          PGPASSWORD=retail123 psql -h localhost -U retail -d retail_warehouse \
+            -f warehouse/init/02_star_schema.sql
+
+      - name: dbt debug
+        working-directory: dbt/retail_dbt
+        run: dbt debug
+
+      - name: dbt run
+        working-directory: dbt/retail_dbt
+        run: dbt run
+
+      - name: dbt test
+        working-directory: dbt/retail_dbt
+        run: dbt test
