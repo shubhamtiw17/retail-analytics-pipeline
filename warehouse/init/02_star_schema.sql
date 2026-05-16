@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS dim_payment_method (
 CREATE TABLE IF NOT EXISTS fact_orders (
     order_id        TEXT        PRIMARY KEY,
     customer_id     TEXT,
-    order_date      DATE+,
+    order_date      DATE,
     total_amount    NUMERIC(12,2),
     item_count      INT,
     status          TEXT,

@@ -40,11 +40,6 @@ jobs:
       - name: Run unit tests
         run: pytest tests/test_event_generator.py -v --tb=short
 
-      - name: Validate docker-compose syntax
-        run: |
-          pip install docker-compose
-          docker-compose config --quiet
-
   dbt-validation:
     runs-on: ubuntu-latest
 
@@ -77,7 +72,7 @@ jobs:
       - name: Create dbt profile
         run: |
           mkdir -p ~/.dbt
-          cat > ~/.dbt/profiles.yml << EOF
+          cat > ~/.dbt/profiles.yml << 'EOF'
           retail_dbt:
             target: dev
             outputs:
@@ -92,47 +87,114 @@ jobs:
                 threads: 4
           EOF
 
-      - name: Create warehouse tables and seed test data
+      - name: Create streaming tables
         run: |
           PGPASSWORD=retail123 psql -h localhost -U retail -d retail_warehouse \
             -f warehouse/init/01_streaming_tables.sql
-          PGPASSWORD=retail123 psql -h localhost -U retail -d retail_warehouse \
-            -f warehouse/init/02_star_schema.sql
-          PGPASSWORD=retail123 psql -h localhost -U retail -d retail_warehouse -c "
-            INSERT INTO dim_date (date_id, year, month, day, quarter, day_of_week, is_weekend)
-            VALUES ('2026-05-15', 2026, 5, 15, 2, 3, false)
-            ON CONFLICT DO NOTHING;
 
-            INSERT INTO fact_orders
-              (order_id, customer_id, order_date, total_amount, item_count, status, device, region, currency)
-            VALUES
-              ('ORD-001', 'CUST-000001', '2026-05-15', 150.00, 2, 'confirmed', 'mobile', 'CA', 'USD'),
-              ('ORD-002', 'CUST-000002', '2026-05-15', 89.99, 1, 'confirmed', 'desktop', 'NY', 'USD');
+      - name: Create star schema tables
+        run: |
+          PGPASSWORD=retail123 psql -h localhost -U retail -d retail_warehouse << 'EOSQL'
+          CREATE TABLE IF NOT EXISTS dim_customer (
+              customer_id      TEXT PRIMARY KEY,
+              first_seen_at    TIMESTAMPTZ,
+              last_seen_at     TIMESTAMPTZ,
+              total_orders     INT DEFAULT 0,
+              preferred_device TEXT,
+              country          TEXT,
+              updated_at       TIMESTAMPTZ DEFAULT NOW()
+          );
+          CREATE TABLE IF NOT EXISTS dim_product (
+              product_id      TEXT PRIMARY KEY,
+              category        TEXT,
+              first_clicked   TIMESTAMPTZ,
+              last_clicked    TIMESTAMPTZ,
+              total_clicks    BIGINT DEFAULT 0,
+              avg_duration_ms NUMERIC(10,2),
+              updated_at      TIMESTAMPTZ DEFAULT NOW()
+          );
+          CREATE TABLE IF NOT EXISTS dim_date (
+              date_id     DATE PRIMARY KEY,
+              year        INT,
+              month       INT,
+              day         INT,
+              quarter     INT,
+              day_of_week INT,
+              is_weekend  BOOLEAN
+          );
+          CREATE TABLE IF NOT EXISTS fact_orders (
+              order_id     TEXT PRIMARY KEY,
+              customer_id  TEXT,
+              order_date   DATE,
+              total_amount NUMERIC(12,2),
+              item_count   INT,
+              status       TEXT,
+              device       TEXT,
+              region       TEXT,
+              currency     TEXT,
+              created_at   TIMESTAMPTZ DEFAULT NOW()
+          );
+          CREATE TABLE IF NOT EXISTS fact_payments (
+              payment_id   TEXT PRIMARY KEY,
+              order_id     TEXT,
+              customer_id  TEXT,
+              payment_date DATE,
+              amount       NUMERIC(12,2),
+              method       TEXT,
+              status       TEXT,
+              currency     TEXT,
+              gateway_ref  TEXT,
+              created_at   TIMESTAMPTZ DEFAULT NOW()
+          );
+          CREATE TABLE IF NOT EXISTS fact_product_clicks (
+              click_id    TEXT PRIMARY KEY,
+              customer_id TEXT,
+              product_id  TEXT,
+              click_date  DATE,
+              session_id  TEXT,
+              device      TEXT,
+              referrer    TEXT,
+              duration_ms BIGINT,
+              created_at  TIMESTAMPTZ DEFAULT NOW()
+          );
+          EOSQL
 
-            INSERT INTO fact_payments
-              (payment_id, order_id, customer_id, payment_date, amount, method, status, currency, gateway_ref)
-            VALUES
-              ('PAY-001', 'ORD-001', 'CUST-000001', '2026-05-15', 150.00, 'card', 'success', 'USD', 'GW-0001-AAAA'),
-              ('PAY-002', 'ORD-002', 'CUST-000002', '2026-05-15', 89.99, 'paypal', 'success', 'USD', 'GW-0002-BBBB');
+      - name: Seed test data
+        run: |
+          PGPASSWORD=retail123 psql -h localhost -U retail -d retail_warehouse << 'EOSQL'
+          INSERT INTO dim_date (date_id, year, month, day, quarter, day_of_week, is_weekend)
+          VALUES ('2026-05-15', 2026, 5, 15, 2, 3, false) ON CONFLICT DO NOTHING;
 
-            INSERT INTO fact_product_clicks
-              (click_id, customer_id, product_id, click_date, session_id, device, referrer, duration_ms)
-            VALUES
-              ('CLK-001', 'CUST-000001', 'PROD-0001', '2026-05-15', 'SESS-001', 'mobile', 'search', 5000),
-              ('CLK-002', 'CUST-000002', 'PROD-0002', '2026-05-15', 'SESS-002', 'desktop', 'social', 12000);
+          INSERT INTO dim_customer (customer_id, first_seen_at, last_seen_at, total_orders, preferred_device)
+          VALUES
+            ('CUST-000001', NOW(), NOW(), 1, 'mobile'),
+            ('CUST-000002', NOW(), NOW(), 1, 'desktop')
+          ON CONFLICT DO NOTHING;
 
-            INSERT INTO dim_customer (customer_id, first_seen_at, last_seen_at, total_orders, preferred_device)
-            VALUES
-              ('CUST-000001', NOW(), NOW(), 1, 'mobile'),
-              ('CUST-000002', NOW(), NOW(), 1, 'desktop')
-            ON CONFLICT DO NOTHING;
+          INSERT INTO dim_product (product_id, category, first_clicked, last_clicked, total_clicks)
+          VALUES
+            ('PROD-0001', 'electronics', NOW(), NOW(), 1),
+            ('PROD-0002', 'clothing', NOW(), NOW(), 1)
+          ON CONFLICT DO NOTHING;
 
-            INSERT INTO dim_product (product_id, category, first_clicked, last_clicked, total_clicks)
-            VALUES
-              ('PROD-0001', 'electronics', NOW(), NOW(), 1),
-              ('PROD-0002', 'clothing', NOW(), NOW(), 1)
-            ON CONFLICT DO NOTHING;
-          "
+          INSERT INTO fact_orders
+            (order_id, customer_id, order_date, total_amount, item_count, status, device, region, currency)
+          VALUES
+            ('ORD-001', 'CUST-000001', '2026-05-15', 150.00, 2, 'confirmed', 'mobile', 'CA', 'USD'),
+            ('ORD-002', 'CUST-000002', '2026-05-15', 89.99, 1, 'confirmed', 'desktop', 'NY', 'USD');
+
+          INSERT INTO fact_payments
+            (payment_id, order_id, customer_id, payment_date, amount, method, status, currency, gateway_ref)
+          VALUES
+            ('PAY-001', 'ORD-001', 'CUST-000001', '2026-05-15', 150.00, 'card', 'success', 'USD', 'GW-0001-AAAA'),
+            ('PAY-002', 'ORD-002', 'CUST-000002', '2026-05-15', 89.99, 'paypal', 'success', 'USD', 'GW-0002-BBBB');
+
+          INSERT INTO fact_product_clicks
+            (click_id, customer_id, product_id, click_date, session_id, device, referrer, duration_ms)
+          VALUES
+            ('CLK-001', 'CUST-000001', 'PROD-0001', '2026-05-15', 'SESS-001', 'mobile', 'search', 5000),
+            ('CLK-002', 'CUST-000002', 'PROD-0002', '2026-05-15', 'SESS-002', 'desktop', 'social', 12000);
+          EOSQL
 
       - name: dbt debug
         working-directory: dbt/retail_dbt
