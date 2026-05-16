@@ -176,14 +176,14 @@ See [docs/RUNBOOK.md](./docs/RUNBOOK.md) for:
 ![Airflow DAG](screenshots/dag-pipeline.png)
 
 ### Dashboard — Live KPIs
-![Dashboard KPIs](screenshots/images-3.png)
-![Dashboard KPIs](screenshots/images-4.png)
+![Dashboard KPIs](screenshots/image-3.png)
+![Dashboard KPIs](screenshots/image-4.png)
 
 ### Dashboard — Product Performance
-![Dashboard Products](screenshots/images-5.png)
+![Dashboard Products](screenshots/image-5.png)
 
 ### Dashboard — Pipeline Health
-![Pipeline Health](screenshots/images-6.png)
+![Pipeline Health](screenshots/image-6.png)
 
 ### dbt — Lineage Graph
 ![dbt Lineage](screenshots/image-2.png)
