@@ -1,0 +1,36 @@
+version: 2
+
+models:
+  - name: mart_daily_revenue
+    description: >
+      Daily revenue KPIs by region. Answers: how much revenue did each
+      region generate per day, and what was the payment success rate?
+    columns:
+      - name: order_date
+        tests: [not_null]
+      - name: gross_revenue
+        tests: [not_null]
+      - name: payment_success_rate
+        description: "Percentage of payments that succeeded (0-100)"
+
+  - name: mart_product_performance
+    description: >
+      Daily product engagement metrics. Answers: which products get the
+      most clicks, from which channels, on which devices?
+    columns:
+      - name: product_id
+        tests: [not_null]
+      - name: total_clicks
+        tests: [not_null]
+
+  - name: mart_customer_summary
+    description: >
+      Customer lifetime value and segmentation. Answers: who are our
+      best customers and how do they behave?
+    columns:
+      - name: customer_id
+        tests: [not_null, unique]
+      - name: customer_segment
+        tests:
+          - accepted_values:
+              values: ['platinum', 'gold', 'silver', 'bronze']

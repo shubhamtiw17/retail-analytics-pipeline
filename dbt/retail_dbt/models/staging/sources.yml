@@ -1,0 +1,38 @@
+version: 2
+
+sources:
+  - name: warehouse
+    database: retail_warehouse
+    schema: public
+    tables:
+      - name: fact_orders
+        description: "Raw orders loaded from bronze Parquet via Airflow"
+        columns:
+          - name: order_id
+            tests: [not_null, unique]
+          - name: customer_id
+            tests: [not_null]
+          - name: total_amount
+            tests: [not_null]
+
+      - name: fact_payments
+        description: "Raw payments loaded from bronze Parquet via Airflow"
+        columns:
+          - name: payment_id
+            tests: [not_null, unique]
+          - name: status
+            tests:
+              - accepted_values:
+                  values: ['success', 'failed', 'pending']
+
+      - name: fact_product_clicks
+        description: "Raw clickstream loaded from bronze Parquet via Airflow"
+        columns:
+          - name: click_id
+            tests: [not_null, unique]
+
+      - name: dim_customer
+        description: "Customer dimension built by Airflow ETL"
+
+      - name: dim_product
+        description: "Product dimension built by Airflow ETL"
